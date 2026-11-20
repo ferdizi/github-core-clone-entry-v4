@@ -1,5 +1,8 @@
-// Entry point: bind an ephemeral port, tell the trial env where it is, then
-// wait until the env says the trial is over and exit 0.
+// Entry point: launch the committed static Go core (`./forge`), tell the
+// trial env where it is, then wait until the env says the trial is over and
+// exit 0. The Go binary binds an ephemeral port and prints `READY <port>`;
+// this launcher reads that line and runs the MAKEFUN register/done protocol
+// exactly as the Node entrypoint did.
 //
 // With MAKEFUN_ENV_URL set (a trial): POST {"port": N} to $MAKEFUN_ENV_URL/register
 // (the first register wins; a 409 means another entry already registered and
@@ -8,7 +11,10 @@
 // Without it (a local run): serve on the ephemeral port and keep running until
 // stopped, printing the port so a local grader can dial it.
 
-import { createApp } from './src/app.ts';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -58,25 +64,51 @@ async function waitForDone(): Promise<void> {
   }
 }
 
-async function main(): Promise<void> {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
+/** Spawn the Go core and wait for its `READY <port>` line. */
+function spawnCore(): Promise<{ child: ChildProcess; port: number }> {
+  const binary = join(dirname(fileURLToPath(import.meta.url)), 'forge');
+  const child = spawn(binary, [], { stdio: ['ignore', 'pipe', 'inherit'] });
+  return new Promise((resolve, reject) => {
+    const lines = createInterface({ input: child.stdout! });
+    const onLine = (line: string): void => {
+      const match = /^READY (\d+)$/.exec(line.trim());
+      if (match === null) return;
+      lines.close();
+      resolve({ child, port: Number(match[1]) });
+    };
+    lines.on('line', onLine);
+    child.once('error', reject);
+    child.once('exit', (code) => {
+      reject(new Error(`forge exited before READY (code ${code ?? '?'})`));
+    });
   });
-  const address = server.address();
-  if (address === null || typeof address === 'string') {
-    throw new Error('the server did not bind an ephemeral TCP port');
-  }
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+}
+
+async function main(): Promise<void> {
+  const { child, port } = await spawnCore();
+  process.stdout.write(`[entry] listening on port ${port}\n`);
+  let stopping = false;
+  const stopChild = (): void => {
+    if (stopping) return;
+    stopping = true;
+    child.kill('SIGTERM');
+  };
+  process.once('SIGTERM', stopChild);
+  process.once('SIGINT', stopChild);
   if (ENV_URL === '') {
     process.stdout.write('[entry] no MAKEFUN_ENV_URL: serving locally until stopped\n');
+    await new Promise<void>((resolve) => {
+      child.once('exit', () => resolve());
+    });
     return;
   }
-  await register(address.port);
+  await register(port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
   await waitForDone();
-  server.close();
+  stopChild();
+  await new Promise<void>((resolve) => {
+    child.once('exit', () => resolve());
+  });
   process.stdout.write('[entry] done\n');
 }
 
