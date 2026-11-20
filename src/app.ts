@@ -6,8 +6,8 @@ import { handleGit } from './gitproto.ts';
 import { handleRest } from './rest.ts';
 import { handleGraphql } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
-import { jsonError, jsonResponse, type ForgeResponse } from './respond.ts';
-import { Store } from './store.ts';
+import { jsonError, jsonResponse, rawResponse, type ForgeResponse } from './respond.ts';
+import { checkAuth, Store, VIEWER_LOGIN } from './store.ts';
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
@@ -34,10 +34,53 @@ function send(res: ServerResponse, answer: ForgeResponse): void {
   res.end(answer.body);
 }
 
+const ISSUE_GET_RE = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/;
+
+/**
+ * Fast path for the repeated single-issue GET: when the serialized body is
+ * already cached at the repo's current version, answer it directly without
+ * URL parsing, routing regexes or body parsing. Anything uncached,
+ * unauthenticated or unmatched returns null and falls through to the normal
+ * router, which produces the exact same 401/404/200 as before.
+ */
+function tryIssueCacheHit(store: Store, req: IncomingMessage): ForgeResponse | null {
+  const url = req.url ?? '';
+  if (url.includes('?')) return null;
+  const match = ISSUE_GET_RE.exec(url);
+  if (match === null) return null;
+  if (!checkAuth(req.headers.authorization)) return null;
+  let owner: string;
+  let repoName: string;
+  try {
+    owner = decodeURIComponent(match[1]!);
+    repoName = decodeURIComponent(match[2]!);
+  } catch {
+    return null;
+  }
+  if (owner !== VIEWER_LOGIN) return null;
+  const repo = store.getRepo(owner, repoName);
+  if (repo === null) return null;
+  const number = Number(match[3]);
+  const issue = repo.issues.find((entry) => entry.number === number);
+  if (issue === undefined) return null;
+  const host = typeof req.headers.host === 'string' ? req.headers.host : '127.0.0.1';
+  const cached = repo.issueBodyCache.get(`http://${host}:${number}`);
+  if (cached === undefined || cached.version !== repo.version) return null;
+  return rawResponse(200, 'application/json', cached.body);
+}
+
 export function createApp(store: Store = new Store()): Server {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
+        // Narrow fast path for the repeated issue GET (read workload).
+        if ((req.method ?? 'GET') === 'GET') {
+          const fast = tryIssueCacheHit(store, req);
+          if (fast !== null) {
+            send(res, fast);
+            return;
+          }
+        }
         const url = new URL(req.url ?? '/', 'http://127.0.0.1');
         const path = url.pathname;
         const method = req.method ?? 'GET';

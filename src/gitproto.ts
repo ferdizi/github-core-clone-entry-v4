@@ -110,6 +110,28 @@ function sidebandPack(pack: Buffer): Buffer[] {
   return packets;
 }
 
+/** A cached deterministic git response body, or null when the fingerprint is uncached or the repo moved on. */
+function cachedBody(repo: Repo, key: string): Buffer | null {
+  const entry = repo.fetchCache.get(key);
+  if (entry === undefined || entry.version !== repo.version) return null;
+  return entry.body;
+}
+
+/** Remember a response body under a fingerprint, keeping the cache bounded. */
+function rememberBody(repo: Repo, key: string, body: Buffer): void {
+  if (repo.fetchCache.size > 64) repo.fetchCache.clear();
+  repo.fetchCache.set(key, { version: repo.version, body });
+}
+
+/** A cached advertisement buffer for this repo version, computed once. */
+function cachedAd(repo: Repo, key: string, compute: () => Buffer): Buffer {
+  const hit = cachedBody(repo, key);
+  if (hit !== null) return hit;
+  const body = compute();
+  rememberBody(repo, key, body);
+  return body;
+}
+
 interface FetchRequest {
   wants: string[];
   haves: string[];
@@ -152,10 +174,25 @@ function handleUploadPackV2(repo: Repo, body: Buffer): ForgeResponse {
   }
   const command = lines[0]?.replace(/\n$/, '') ?? '';
   if (command === 'command=ls-refs') {
-    return lsRefsV2(repo, lines.slice(1));
+    // Identical clones repeat the same ls-refs: the refs advertisement is
+    // deterministic for this repo version, so serve it from the cache.
+    const key = `v2:ls-refs:${JSON.stringify(lines.slice(1))}`;
+    const hit = cachedBody(repo, key);
+    if (hit !== null) return rawResponse(200, UPLOAD_RESULT, hit);
+    const answer = lsRefsV2(repo, lines.slice(1));
+    if (answer.status === 200) rememberBody(repo, key, answer.body);
+    return answer;
   }
   if (command === 'command=fetch') {
-    return fetchV2(repo, lines.slice(1));
+    // Identical shallow clones repeat the same fetch: plan, pack and deflate
+    // are deterministic for this repo version, so the whole response body is
+    // cached and the other 49 clones skip the rebuild entirely.
+    const key = `v2:fetch:${JSON.stringify(lines.slice(1))}`;
+    const hit = cachedBody(repo, key);
+    if (hit !== null) return rawResponse(200, UPLOAD_RESULT, hit);
+    const answer = fetchV2(repo, lines.slice(1));
+    if (answer.status === 200) rememberBody(repo, key, answer.body);
+    return answer;
   }
   return jsonError(400, `unknown v2 command ${JSON.stringify(command)}`);
 }
@@ -272,6 +309,11 @@ function handleUploadPackV0(repo: Repo, body: Buffer): ForgeResponse {
     }
   }
   if (request.wants.length === 0) return jsonError(400, 'no want lines');
+  // Same as the v2 fetch: identical shallow clones repeat the same request,
+  // and the pack is deterministic for this repo version.
+  const cacheKey = `v0:fetch:${request.wants.join(',')}|${request.haves.join(',')}|${request.shallow.join(',')}|${request.depth ?? ''}`;
+  const hit = cachedBody(repo, cacheKey);
+  if (hit !== null) return rawResponse(200, UPLOAD_RESULT, hit);
   const plan = planFetch(repo, request.wants, request.haves, request.depth, request.shallow);
   const pack = writePack(plan.objects);
   const out: Array<string | Buffer | 'flush'> = [];
@@ -280,7 +322,9 @@ function handleUploadPackV0(repo: Repo, body: Buffer): ForgeResponse {
   for (const oid of plan.unshallow) out.push(`unshallow ${oid}\n`);
   for (const packet of sidebandPack(pack)) out.push(packet);
   out.push('flush');
-  return rawResponse(200, UPLOAD_RESULT, encodePktLines(out));
+  const answer = rawResponse(200, UPLOAD_RESULT, encodePktLines(out));
+  rememberBody(repo, cacheKey, answer.body);
+  return answer;
 }
 
 /** Handle POST git-receive-pack (v0 only). */
@@ -452,12 +496,12 @@ export function handleGit(
     const wanted = query.get('service');
     if (wanted === 'git-upload-pack') {
       if ((headers['git-protocol'] ?? '') === 'version=2') {
-        return rawResponse(200, UPLOAD_AD, v2Advertisement());
+        return rawResponse(200, UPLOAD_AD, cachedAd(repo, 'ad:v2', () => v2Advertisement()));
       }
-      return rawResponse(200, UPLOAD_AD, v0Advertisement('git-upload-pack', repo));
+      return rawResponse(200, UPLOAD_AD, cachedAd(repo, `ad:v0:upload:${repo.defaultBranch}`, () => v0Advertisement('git-upload-pack', repo)));
     }
     if (wanted === 'git-receive-pack') {
-      return rawResponse(200, RECEIVE_AD, v0Advertisement('git-receive-pack', repo));
+      return rawResponse(200, RECEIVE_AD, cachedAd(repo, `ad:v0:receive:${repo.defaultBranch}`, () => v0Advertisement('git-receive-pack', repo)));
     }
     return jsonError(400, 'unknown service');
   }

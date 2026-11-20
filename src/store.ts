@@ -92,6 +92,8 @@ export interface Repo {
   version: number;
   /** Serialized single-issue GET bodies, keyed by origin + number; valid only at the recorded repo version. */
   issueBodyCache: Map<string, { version: number; body: Buffer }>;
+  /** Cached deterministic git responses (fetch packs, ls-refs, advertisements), keyed by request fingerprint; valid only at the recorded repo version. */
+  fetchCache: Map<string, { version: number; body: Buffer }>;
 }
 
 /** One global id (GraphQL Relay style): base64url of "Kind:parts...". Opaque, stable. */
@@ -152,6 +154,7 @@ export class Store {
       commentSeq: 0,
       version: 0,
       issueBodyCache: new Map(),
+      fetchCache: new Map(),
     };
     this.repoIdSeq += 1;
     this.repos.set(`${VIEWER_LOGIN}/${name}`, repo);
